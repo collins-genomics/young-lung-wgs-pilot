@@ -1,0 +1,138 @@
+---
+title: "PRS Association"
+output: html_document
+date: "2026-05-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(patchwork)
+library(ggplot2)
+```
+
+```{r get_sig_sets}
+levels <- c("CV", "CV_HIGH", "CV_HIGH_REVEL05")
+
+allCats <- as.vector(outer(c("YL", "NVS", "YL_NVS"), levels, paste, sep = '_'))
+all_data <- fread(paste0("../PilotData/HeatmapData/allRegResultsUpdated.tsv"))
+sigSets <- lapply(allCats, function(pre) {
+  unique(all_data[category == pre & pval < 0.05]$geneset)
+})
+names(sigSets) <- allCats
+
+sigGenes <- lapply(allCats, function(cat) {
+  sets <- sigSets[[cat]]
+  genelist <- c()
+  for (set in sets) {
+    setGenes <- readLines(paste0("../PilotData/Misc/gene_list_files/", set, ".txt"))
+    genelist <- c(genelist, setGenes[setGenes != ""])
+  }
+  unique(genelist)
+})
+names(sigGenes) <- allCats
+allSigGenes <- Reduce(c, sigGenes)
+```
+
+
+```{r load_data}
+prsType <- "adeno"
+sampCovars <- c(paste0(prsType, "_Byun_PRS_PV7_scaledscore"), "sex", paste0("PC", 1:5, "_EUR"))
+sampData <- fread("../PilotData/GenesetData/Samples/all_covariates.tsv")[!(sample_id %like% "TPMCCDG")]
+sampData <- sampData[sample_id != "NSLC-0170"]
+# sampData <- sampData[histology == "LUAD"]
+
+catIds <- list(
+  "YL" = sampData$sample_id[!(sampData$sample_id %like% "NSLC")],
+  "NVS" = sampData$sample_id[sampData$sample_id %like% "NSLC"],
+  "YL_NVS" = sampData$sample_id
+)
+
+ctTbls <- lapply(levels, function(lvl) {
+  tmpTbl <- fread(paste0("../PilotData/GenesetData/counts/sample_counts_", lvl, ".tsv"))
+  tmpTbl <- tmpTbl[rowSums(tmpTbl[,-c(1:2)], na.rm = TRUE) < 3]
+  tmpTbl[, locus := str_replace(locus, "_[^_]*$", "")]
+  tmpTbl
+})
+names(ctTbls) <- levels
+
+pltList <- list()
+altRes <- data.table()
+densPlts <- list()
+for (cat in c("YL", "NVS", "YL_NVS")) {
+  for (lvl in levels) {
+    regTbl <- data.table::transpose(unique(ctTbls[[lvl]][geneset %in% sigSets[[paste(cat, lvl, sep='_')]]], by = "locus")[,-1], 
+                                    keep.names = "sample_id",
+                                    make.names = "geneset")[sample_id %in% catIds[[cat]]]
+    regTbl <- regTbl[,.(sample_id, burden = rowSums(regTbl[,-1], na.rm=TRUE))]
+    regTbl <- regTbl[sampData[, c("sample_id", sampCovars), with = FALSE], on = "sample_id", nomatch=0]
+    
+    model = glm(burden ~ ., family = "poisson", data = regTbl[,-1])
+    regTbl[, predicted := predict(model, type = "response")]
+    
+    pltList <- c(pltList, (ggplot(regTbl,
+           aes(x = .data[[paste0(prsType, "_Byun_PRS_PV7_scaledscore")]],
+               y = burden)) +
+      geom_point() +
+      geom_smooth(aes(y = predicted), color = "blue") +
+      ggtitle(paste0(cat, "_", lvl, " enriched genes (", lvl, " variants)"))  +
+      theme_classic() +
+      scale_x_continuous(expand = c(0,0)) +
+      theme(text = element_text(size = 16))))
+
+    res <- summary(model)
+    altRes <- rbind(altRes, data.table(
+        geneset = "Combined",
+        category = paste0(cat, "_", lvl),
+        beta = res$coefficients[2,1],
+        stderr = res$coefficients[2,2],
+        pval = res$coefficients[2,4],
+        IRR = exp(res$coefficients[2,1])
+    ))
+  }
+}
+
+Reduce('+', densPlts)
+fwrite(altRes, paste0("../PilotData/PRS/", prsType, "_prs_results_combined_geneset.tsv"), sep='\t')
+```
+
+```{r synvars}
+synvar <- fread("../PilotData/PRS_variants/synvars_counts.tsv")
+synvar <- synvar[rowSums(synvar[,-(1:2)], na.rm = TRUE) < 3]
+synvar[, locus := str_replace(locus, "_[^_]*$", "")]
+
+synPltList <- list()
+synRes <- data.table()
+for (cat in c("YL", "NVS", "YL_NVS")) {
+  for (lvl in levels) {
+    regTbl <- data.table::transpose(unique(synvar[gene %in% sigGenes[[paste(cat, lvl, sep='_')]]], by = "locus")[,-1], 
+                                keep.names = "sample_id",
+                                make.names = "gene")[sample_id %in% catIds[[cat]]]
+    regTbl[,1:5]
+    regTbl <- regTbl[,.(sample_id, burden = rowSums(regTbl[,-1], na.rm=TRUE))]
+    regTbl <- regTbl[sampData[, c("sample_id", sampCovars), with = FALSE], on = "sample_id", nomatch=0]
+    model = glm(burden ~ ., family = "poisson", data = regTbl[,-1])
+    regTbl[, predicted := predict(model, type = "response")]
+    
+    synPltList <- c(synPltList, (ggplot(regTbl,
+           aes(x = lungca_Byun_PRS_PV7_scaledscore,
+               y = burden)) +
+      geom_point() +
+      geom_smooth(aes(y = predicted), color = "blue") +
+      ggtitle(paste0(cat, "_", lvl, " enriched genes (synonymous variants)"))  +
+      theme_classic() +
+      scale_x_continuous(expand = c(0,0)) +
+      theme(text = element_text(size = 16))))
+
+    res <- summary(model)
+    synRes <- rbind(synRes, data.table(
+        geneset = "low_impact",
+        category = paste0(cat, "_", lvl),
+        beta = res$coefficients[2,1],
+        stderr = res$coefficients[2,2],
+        pval = res$coefficients[2,4],
+        IRR = exp(res$coefficients[2,1])
+    ))
+  }
+}
+```

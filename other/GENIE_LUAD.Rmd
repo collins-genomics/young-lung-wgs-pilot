@@ -1,0 +1,185 @@
+---
+title: "GENIE Analysis"
+output: html_document
+date: "2026-05-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include=FALSE)
+
+library(data.table)
+library(stringr)
+```
+
+```{r load_data}
+mutData <- fread("../PilotData/GENIE/GENIE_LUAD.tsv")
+clinData <- fread("../PilotData/GENIE/GENIE_LUAD_clinical.tsv")
+
+# per gene files
+cancerGenes <- c("EGFR", "KRAS","ALK", "ROS1", "RET", "MET", "ERBB2", "BRAF", "NTRK1")
+fusionGenes <- c("ALK", "ROS1", "RET")
+drivers <- lapply(cancerGenes, function(gene) {
+  driverTbl <- fread(paste0("../PilotData/GENIE/", gene, "_drivers.tsv"))
+  if (gene == "BRAF") {
+    driverTbl <- driverTbl[Annotation %like% "level_1" | `Protein Change` %like% "G464" | `Protein Change` %like% "G469"]
+  } else if (gene == "KRAS") {
+    driverTbl <- driverTbl[Annotation %like% "level_1" | `Protein Change` %like% "Q61" | `Protein Change` %like% "G12" | `Protein Change` %like% "G13"]
+  } else {
+    driverTbl <- driverTbl[Annotation %like% "level_1"]
+  }
+  
+  driverTbl
+})
+names(drivers) <- cancerGenes
+
+# Remove specific resistance mutations for EGFR
+egfr_mut_list <- readLines("~/Desktop/LungData/PilotData/GENIE/EGFR_driver_mutation_list_JL_filter.txt")
+# egfr_blacklist <- c("T790M", "C797S", "A289V", "K754E", "R252C","T263P","A750P","G598V","R222C","P596L","G810D",
+#                     "K708R","E734K","E114K","A289T","A289F","K754R","R108G","R108S","K754T","A289Y","R252H","L858K",
+#                     "R252L","R252P","A750S","R222L","T363P","H304Y","D256Y")
+drivers$EGFR <- drivers$EGFR[`Protein Change` %in% egfr_mut_list]
+
+# filter down fusion genes
+drivers[fusionGenes] <- lapply(fusionGenes, function(gene) {
+  drivers[[gene]][`Mutation Type` == "fusion"]
+})
+
+for (gene in cancerGenes) {
+  writeLines(unique(drivers[[gene]]$`Protein Change`), paste0("../PilotData/GENIE/mutation_lists_filtered/", gene, "_driver_mutation_list.txt"))
+}
+
+# make total fusion set
+fusionTbl <- rbindlist(lapply(drivers, function(tbl) {
+  tbl[`Mutation Type` == "fusion"]
+}))
+
+```
+
+```{r format_data, echo=FALSE, include=FALSE}
+mutData[, track_name := paste(track_name, track_type, sep = '_')]
+mutData <- data.table::transpose(mutData, keep.names="case_id")
+colnames(mutData) <- unlist(mutData[1])
+mutData <- mutData[-(1:2)]
+setnames(mutData, "track_name", "Patient ID")
+genieTbl <- mutData[clinData, on = "Patient ID"]
+setnames(genieTbl, "Age at Which Sequencing was Reported (Years)", "seq_age")
+setorder(genieTbl, "seq_age")
+genieTbl <- unique(genieTbl, by = "Patient ID")
+
+# filter to known age, fix age values
+genieTbl <- genieTbl[!is.na(seq_age)][seq_age != "Unknown"]
+genieTbl[, seq_age := as.numeric(fifelse(seq_age=="<18", "18",
+                                         fifelse(seq_age==">89", "89", seq_age)))]
+```
+
+```{r egfr, include=FALSE}
+res <- rbindlist(lapply(cancerGenes, function(gene) {
+  print(gene)
+  tmpTbl <- genieTbl[!is.na(genieTbl[[paste0(gene, "_MUTATIONS")]])]
+  tmpTbl[, let(has_driver = fifelse(`Sample ID` %in% drivers[[gene]]$`Sample ID`, "Yes", "No"),
+               age_group = fifelse(seq_age > 45, "Old", "Young"))]
+  
+  contTbl <- table(tmpTbl$has_driver, tmpTbl$age_group)
+  fish <- fisher.test(contTbl)
+  data.table(gene_name = gene, OR = fish$estimate, lower_ci = fish$conf.int[1][1], upper_ci = fish$conf.int[2][1], pval = fish$p.value)
+}))
+
+# we have enough data, opting to filter to samples where all fusion genes of interest were tested
+compCols <- paste(cancerGenes, "MUTATIONS", sep = "_") 
+fusionCases <- genieTbl[complete.cases(genieTbl[, ..compCols])]
+fusionCases[, let(has_driver = fifelse(`Sample ID` %in% fusionTbl$`Sample ID`, "Yes", "No"),
+               age_group = fifelse(seq_age > 45, "Old", "Young"))]
+contTbl <- table(fusionCases$has_driver, fusionCases$age_group)
+fish <- fisher.test(contTbl)
+res <- rbind(res, data.table(gene_name = "All Fusions", OR = fish$estimate, lower_ci = fish$conf.int[1][1], upper_ci = fish$conf.int[2][1], pval = fish$p.value))
+
+fusionCases[, no_driver := fifelse(`Sample ID` %in% Reduce(c, lapply(drivers, function(tbl) tbl$`Sample ID`)), 0, 1)]
+contTbl <- table(fusionCases$no_driver, fusionCases$age_group)
+fish <- fisher.test(contTbl)
+res <- rbind(res, data.table(gene_name = "Other/WT", OR = fish$estimate, lower_ci = fish$conf.int[1][1], upper_ci = fish$conf.int[2][1], pval = fish$p.value))
+
+fwrite(res, "../PilotData/GENIE/GENIE_results_updated.tsv", sep='\t')
+```
+
+```{r regressions}
+regResults <- rbindlist(lapply(cancerGenes, function(gene) {
+  tmpTbl <- genieTbl[!is.na(genieTbl[[paste0(gene, "_MUTATIONS")]])]
+  tmpTbl[, has_driver := fifelse(`Sample ID` %in% drivers[[gene]]$`Sample ID`, 1, 0)]
+  
+  sum <- summary(glm(tmpTbl$has_driver ~ tmpTbl$seq_age, family = "binomial"))
+  data.table(gene_name = gene, coefficient = sum$coefficients[2,1],
+             stderr = sum$coefficients[2,2], pval = sum$coefficients[2,4],
+             OR = exp(sum$coefficients[2,1]),
+             increase_per_year = exp(sum$coefficients[2,1])-1)
+}))
+
+fusionCases[, has_driver := fifelse(has_driver=="Yes", 1, 0)]
+fusionSum <- summary(glm(fusionCases$has_driver ~ fusionCases$seq_age, family = "binomial"))
+regResults <- rbind(regResults,
+                    data.table(gene_name = "All Fusions", coefficient = fusionSum$coefficients[2,1],
+                               stderr = fusionSum$coefficients[2,2], pval = fusionSum$coefficients[2,4],
+                               OR = exp(fusionSum$coefficients[2,1]),
+                               increase_per_year = exp(fusionSum$coefficients[2,1])-1))
+
+otherSum <- summary(glm(fusionCases$no_driver ~ fusionCases$seq_age, family = "binomial"))
+regResults <- rbind(regResults,
+                    data.table(gene_name = "Other/WT", coefficient = otherSum$coefficients[2,1],
+                               stderr = otherSum$coefficients[2,2], pval = otherSum$coefficients[2,4],
+                               OR = exp(otherSum$coefficients[2,1]),
+                               increase_per_year = exp(otherSum$coefficients[2,1])-1))
+
+fwrite(regResults, "../PilotData/GENIE/GENIE_regressions_updated.tsv", sep='\t')
+```
+
+```{r plot_data}
+pltData <- rbindlist(lapply(cancerGenes, function(gene) {
+  tmpTbl <- genieTbl[!is.na(genieTbl[[paste0(gene, "_MUTATIONS")]])]
+  tmpTotal <- nrow(tmpTbl)
+  data.table(gene_name = gene,
+             under_40 = nrow(tmpTbl[seq_age <= 40 & `Sample ID` %in% drivers[[gene]]$`Sample ID`]) / 
+               nrow(tmpTbl[seq_age <= 40]),
+             under_45 = nrow(tmpTbl[seq_age <= 45 & `Sample ID` %in% drivers[[gene]]$`Sample ID`]) / 
+               nrow(tmpTbl[seq_age <= 45]),
+             over_45 = nrow(tmpTbl[seq_age >45 & `Sample ID` %in% drivers[[gene]]$`Sample ID`]) / 
+               nrow(tmpTbl[seq_age > 45]))
+}))
+pltData <- rbind(pltData, data.table(gene_name = "All Fusions",
+                                     under_40 = nrow(fusionCases[seq_age <= 40 & `Sample ID` %in% fusionTbl$`Sample ID`]) /
+                                       nrow(fusionCases[seq_age <= 40]),
+                                     under_45 = nrow(fusionCases[seq_age <= 45 & `Sample ID` %in% fusionTbl$`Sample ID`]) /
+                                       nrow(fusionCases[seq_age <= 45]),
+                                     over_45 = nrow(fusionCases[seq_age > 45 & `Sample ID` %in% fusionTbl$`Sample ID`]) /
+                                       nrow(fusionCases[seq_age > 45])))
+
+no_driver_list <- fusionCases[no_driver == 1]$`Sample ID`
+pltData <- rbind(pltData, data.table(gene_name = "Other/WT",
+                                     under_40 = nrow(fusionCases[seq_age <= 40 & `Sample ID` %in% no_driver_list]) /
+                                       nrow(fusionCases[seq_age <= 40]),
+                                     under_45 = nrow(fusionCases[seq_age <= 45 & `Sample ID` %in% no_driver_list]) /
+                                       nrow(fusionCases[seq_age <= 45]),
+                                     over_45 = nrow(fusionCases[seq_age > 45 & `Sample ID` %in% no_driver_list]) /
+                                       nrow(fusionCases[seq_age > 45])))
+
+
+pltData$gene_name <- factor(pltData$gene_name, levels = c(cancerGenes, "All Fusions", "Other/WT"))
+setnames(pltData, c("under_40", "under_45", "over_45"), c("40 and under", "45 and under", "Over 45"))
+pltData <- melt(pltData, id.vars = c("gene_name"), variable.name = "Group")
+pltData[, value := value * 100]
+
+pltData <- pltData[gene_name %in% c("All Fusions", "EGFR", "KRAS", "Other/WT")]
+pltData$gene_name <- factor(pltData$gene_name, levels = c("All Fusions", "KRAS", "EGFR", "Other/WT"))
+ggplot(pltData, aes(gene_name, value, fill = Group)) + 
+  geom_bar(stat = "identity", position = position_dodge2(padding = 0.2), width = 0.8) +
+  theme_classic() +
+  ylab("Percent of total in age group (%)") +
+  xlab("") +
+  theme(
+    # legend.position="inside", 
+    # legend.position.inside = c(0.9, 0.9), 
+    axis.text.x = element_text(size=16, angle = 45, vjust = 1, hjust = 1),
+    axis.text.y = element_text(size=16),
+    axis.title.y = element_text(size=16)) +
+  scale_y_continuous(limits = c(0, 40), expand=c(0,0)) +
+  scale_fill_manual(values = c("40 and under" = "#4093d6", "45 and under" = "#e3793b", "Over 45" = "gray"))
+ggsave("../Plots/GENIE_plot_subset.png", height = 6, width = 8)
+```

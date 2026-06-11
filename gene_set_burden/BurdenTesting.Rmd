@@ -1,0 +1,307 @@
+---
+title: "PLINK Cleanup"
+output: html_document
+date: "2026-02-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(stringr)
+```
+
+```{r load_data, include=FALSE}
+varLevel <- "CV"
+setFiles <- list.files(paste0("../PilotData/GenesetData/", varLevel), full.names = TRUE)
+
+ylSampData <- fread("../PilotData/GenesetData/Samples/ylSamples.tsv")
+ylSampData <- ylSampData[case_control == "control" | histology != "Carcinoid"]
+
+nvsSampData <- fread("../PilotData/GenesetData/Samples/nvsSamples.tsv")
+
+sampData <- fread("../PilotData/GenesetData/Samples/allSamples.tsv")
+setnames(sampData, "sample_id", "sample_ID")
+
+tfams <- setFiles[setFiles %like% ".tfam$"]
+tfam <- fread(tfams[1])
+  
+if (!file.exists(paste0("../PilotData/GenesetData/BurdenResults/CombinedTped", "_", varLevel, ".tsv"))) {
+  tpeds <- setFiles[setFiles %like% ".tped$"]
+  tpedData <- lapply(tpeds, fread) 
+  
+  # Confirm shared tfam data 
+  # tfamOrders <- lapply(tfamData, function(x) x$V2) 
+  # any(unlist(lapply(tfamOrders, function(x) x != tfamOrders[[1]])))
+  
+  tpedNames <- str_extract(tpeds, "(?<=GENESETS\\.).*(?=\\.biallelic)")
+  names(tpedData) <- tpedNames
+  tpedData <- tpedData[unlist(lapply(tpedData, function(x) nrow(x) > 0))]
+}
+```
+
+```{r clean_data, echo=FALSE}
+if (!file.exists(paste0("../PilotData/GenesetData/BurdenResults/CombinedTped", "_", varLevel, ".tsv"))) {
+  # get locus "names" for genesets
+  varCols <- colnames(tpedData[[1]])[5:ncol(tpedData[[1]])] # assume same num of cols, which should be true
+  dropCols <- paste0("V", 1:4)
+  for (i in 1:length(tpedData)) {
+    setName <- names(tpedData)[i]
+    tpedData[[i]][, let(locus = paste0("chr", paste(V1, V4, V5, .I, sep = "_")),
+                        geneset = setName)]
+    tpedData[[i]][, (dropCols) := NULL]
+    setcolorder(tpedData[[i]], c("locus", "geneset", varCols))
+  }
+  
+  fwrite(tpedData[[1]], paste0("../PilotData/GenesetData/BurdenResults/CombinedTped", "_", varLevel, ".tsv"), sep = '\t') # write once to get colnames
+  for (tpedFile in tpedData[2:length(tpedData)]) {
+    fwrite(tpedFile, paste0("../PilotData/GenesetData/BurdenResults/CombinedTped", "_", varLevel, ".tsv"), sep = '\t', append = TRUE)
+  }
+}
+
+# tpedAll <- rbindlist(tpedData) # combine all datasets into single data table
+
+# workaround for windows 
+tpedAll <- fread(paste0("../PilotData/GenesetData/BurdenResults/CombinedTped", "_", varLevel, ".tsv"),
+                 na.strings = "0")
+```
+
+```{r count_alleles, include=FALSE}
+if (!file.exists(paste0("../PilotData/GenesetData/BurdenResults/CombinedTped", "_", varLevel, ".bin.tsv"))) {
+  # get major allele at each locus
+  varCols <- colnames(tpedAll)[-c(1,2)]
+  
+  mca <- c()
+  pb = txtProgressBar(min = 0, max = nrow(tpedAll), initial = 0, style = 3) 
+  for (i in 1:nrow(tpedAll)) {
+    mca <- c(mca,
+             names(which.max(table(unlist(tpedAll[i, 3:ncol(tpedAll)])))))
+    setTxtProgressBar(pb,i)
+  }
+  close(pb)
+  
+  tpedAll <- tpedAll[!is.na(mca)]
+  mca <- mca[!is.na(mca)]
+  
+  pb = txtProgressBar(min = 0, max = ncol(tpedAll), initial = 0, style = 3) 
+  for (col in colnames(tpedAll)[3:ncol(tpedAll)]) {
+    tpedAll[[col]] <- as.integer(tpedAll[[col]] != mca)
+    setTxtProgressBar(pb,i)
+  }
+  close(pb)
+
+  fwrite(tpedAll, paste0("../PilotData/GenesetData/BurdenResults/CombinedTped", "_", varLevel, ".bin.tsv"), sep = '\t')
+} else {
+  tpedAll <- fread(paste0("../PilotData/GenesetData/BurdenResults/CombinedTped", "_", varLevel, ".bin.tsv"))
+}
+
+# set column names to participant IDs
+firstCols <- (1:nrow(tfam)) * 2 - 1 + 2
+sampIds <- tfam$V2
+colnames(tpedAll)[c(firstCols, firstCols + 1)] <- c(sampIds, paste0(sampIds, "_2"))
+
+tpedAll[, (sampIds) := Map(`+`, .SD, tpedAll[, paste0(sampIds, "_2"), with = FALSE]), .SDcols = sampIds]
+tpedAll <- tpedAll[, c("locus", "geneset", sampIds), with = FALSE]
+```
+
+```{r load_sample_data, include = FALSE}
+ylIds <- ylSampData[age <= 45 | case_control == "control"]$sample_ID
+nvsIds <- nvsSampData$sample_ID
+combIds <- ylSampData$sample_ID
+
+keep <- c("sample_ID", "case_control", "sex", paste0("PC", 1:5, "_EUR"))
+
+sampData <- sampData[, ..keep]
+# nvsIds <- readLines("~/Downloads/nvsIDs.tsv")
+# nvsIds <- sampData$sample_ID[sampData$sample_ID %like% "NSLC"]
+sampData[, case_control := case_control == "case"]
+sampData <- sampData[complete.cases(sampData)]
+
+# groupNames <- c("YL", "NVS", "YL_NVS")
+# sampLists <- list(sampData[sample_ID %in% ylIds | case_control == FALSE]$sample_ID, # 159 cases
+#                   sampData[sample_ID %in% nvsIds | case_control == FALSE]$sample_ID, # 175 cases
+#                   sampData$sample_ID) # 326 cases (8 overlap in YL/NVS)
+
+sampLists <- list(ylIds, nvsIds, combIds)
+names(sampLists) <- groupNames
+
+#################################
+
+# comball <- fread("~/Downloads/combined_data_ALL.tsv")
+# comball[, sample_ID := sample_id]
+# comball <- comball[,..keep]
+# comball <- comball[complete.cases(comball)]
+# comball[, let(case_control = case_control == "case", sex = ifelse(sex == "M", "MALE", "FEMALE"))]
+# 
+# sampLists <- list(sampData[sample_ID %in% ylIds | case_control == FALSE]$sample_ID, # 159 cases
+#                   comball[sample_ID %in% nvsIds | case_control == FALSE]$sample_ID, # 175 cases
+#                   sampData$sample_ID) # 326 cases (8 overlap in YL/NVS)
+# names(sampLists) <- groupNames
+
+##################################
+
+
+regTables <- lapply(groupNames, function(group) {
+  tmpTbl <- tpedAll[, c("locus", "geneset", sampLists[[group]]), with = FALSE]
+  tmpTbl[, let(MAF = (rowMeans(.SD, na.rm = TRUE) / 2),
+               MAC = rowSums(.SD, na.rm = TRUE)), .SDcols = sampLists[[group]]]
+  # tmpTbl <- tmpTbl[MAC <= 2][, -c("locus", "MAF", "MAC")][, lapply(.SD, sum, na.rm = TRUE), by = geneset]
+  tmpTbl <- tmpTbl[MAC <= 2][, -c("locus", "MAF", "MAC")][, lapply(.SD, function(x) { ifelse(sum(x, na.rm = TRUE) > 0, 1, 0) }), by = geneset]
+  sampData[
+    transpose(tmpTbl, keep.names = "sample", make.names = "geneset"), on = c("sample_ID" = "sample")
+  ]
+})
+names(regTables) <- groupNames
+
+# regTablesAlt <- lapply(groupNames, function(group) {
+#   tmpTbl <- tpedAll[, c("locus", "geneset", sampLists[[group]]), with = FALSE]
+#   tmpTbl[, let(MAF = (rowMeans(.SD, na.rm = TRUE) / 2),
+#                MAC = rowSums(.SD, na.rm = TRUE)), .SDcols = sampLists[[group]]]
+#   # tmpTbl <- tmpTbl[MAC <= 2][, -c("locus", "MAF", "MAC")][, lapply(.SD, sum, na.rm = TRUE), by = geneset]
+#   tmpTbl <- tmpTbl[MAC <= 2][, -c("locus", "MAF", "MAC")][, lapply(.SD, function(x) { ifelse(sum(x, na.rm = TRUE) > 0, 1, 0) }), by = geneset]
+#   comball[
+#     transpose(tmpTbl, keep.names = "sample", make.names = "geneset"), on = c("sample_ID" = "sample")
+#   ]
+# })
+# names(regTablesAlt) <- groupNames
+```
+
+```{r regression}
+regList <- lapply(groupNames, function(group) {
+  tmpList <- lapply(colnames(regTables[[group]])[-c(1:8)], function(set) {
+    regCols <- c(keep[-1], set)
+    summary(glm(case_control ~ ., 
+                data = regTables[[group]][, ..regCols], family = "binomial"))
+  })
+  
+  names(tmpList) <- colnames(regTables[[group]])[-c(1:8)]
+  tmpList
+})
+names(regList) <- groupNames
+
+# regListAlt <- lapply(groupNames, function(group) {
+#   tmpList <- lapply(colnames(regTablesAlt[[group]])[-c(1:8)], function(set) {
+#     regCols <- c(keep[-1], set)
+#     summary(glm(case_control ~ ., 
+#                 data = regTablesAlt[[group]][, ..regCols], family = "binomial"))
+#   })
+#   
+#   names(tmpList) <- colnames(regTablesAlt[[group]])[-c(1:8)]
+#   tmpList
+# })
+# names(regListAlt) <- groupNames
+```
+
+```{r inspect_regressions, include=FALSE}
+resList <- lapply(groupNames, function(group) {
+  rbindlist(lapply(colnames(regTables[[group]])[-c(1:8)], function(set) {
+    if (dim(regList[[group]][[set]]$coef)[1] == 7) {
+      data.table(NULL)
+    } else {
+      data.table(geneset = set,
+                 beta = regList[[group]][[set]]$coef[8,1],
+                 stderr = regList[[group]][[set]]$coef[8,2],
+                 pval = regList[[group]][[set]]$coef[8,4])
+    }
+  }))
+})
+names(resList) <- groupNames
+
+# resListAlt <- lapply(groupNames, function(group) {
+#   rbindlist(lapply(colnames(regTablesAlt[[group]])[-c(1:8)], function(set) {
+#     if (dim(regListAlt[[group]][[set]]$coef)[1] == 7) {
+#       data.table(NULL)
+#     } else {
+#       data.table(geneset = set,
+#                  beta = regListAlt[[group]][[set]]$coef[8,1],
+#                  stderr = regListAlt[[group]][[set]]$coef[8,2],
+#                  pval = regListAlt[[group]][[set]]$coef[8,4])
+#     }
+#   }))
+# })
+# names(resListAlt) <- groupNames
+```
+
+```{r check_data}
+expected <- fread("../PilotData/HeatmapData/all.csv")
+compData <- lapply(groupNames, function(group) {
+  expRes <- expected[category == paste0(group, "_", varLevel), c("geneset", "pval", "OR")]
+  resList[[group]][, .(geneset, pval, OR = exp(beta))][
+    expRes,
+    on = c("geneset" = "geneset")
+  ]
+})
+names(compData) <- groupNames
+compData <- lapply(compData, function(x) x[complete.cases(x)])
+roundCols <- colnames(compData[[1]])[-1]
+compData <- lapply(compData, function(x) x[, (roundCols) := lapply(.SD, function(col) round(col, 5)), .SDcols = roundCols])
+
+for (comp in compData) {
+  print(comp[abs(comp$pval - comp$i.pval) > 0.00002 | abs(comp$OR - comp$i.OR) > 0.00002])
+}
+```
+
+```{r}
+# # Rerun original script to ensure consistent processing, used for debugging
+# 
+# # Process data and report the frequency of doubleton carriers; as binary or continuous
+# mat = read.table("~/Desktop/LungData/PilotData/GenesetData/CV/YLplusTOPmed.coding.gnomad.noncancer.af.nfe.filtered.clinvarannot.PLPDR.ConfPLP_snpEff.GENESETS.EGFR.bialleliconly_genelist_filtered.converted.tped",as.is=T)
+# 
+# mat[, 2] = paste("chr", mat[, 1], "_", mat[, 4], "_", mat[, 5], "_", seq_len(nrow(mat)), sep = "")
+# 
+# fam = read.table("~/Desktop/LungData/PilotData/GenesetData/CV/YLplusTOPmed.coding.gnomad.noncancer.af.nfe.filtered.clinvarannot.PLPDR.ConfPLP_snpEff.GENESETS.EGFR.bialleliconly_genelist_filtered.converted.tfam",as.is=T)
+# 
+# mat.calls = mat[,5:ncol(mat)]
+# row.names(mat.calls) = mat[,2]
+# 
+# # get most common allele
+# mat.calls[ mat.calls == "0" ] = NA
+# maxval = apply(mat.calls,1,function(x) names(which.max(table(x))))
+# 
+# # remove fields with only missing values
+# miss.drop = is.na(maxval)
+# 
+# mat.calls = mat.calls[!miss.drop,]
+# maxval = maxval[!miss.drop]
+# 
+# # convert to binary
+# mat.calls.bin = matrix(NA,nrow=nrow(mat.calls),ncol=ncol(mat.calls))
+# for ( i in 1:ncol(mat.calls) ) {
+#   mat.calls.bin[ !is.na(mat.calls[,i]) & mat.calls[,i] == maxval , i ] = 1
+#   mat.calls.bin[ !is.na(mat.calls[,i]) & mat.calls[,i] != maxval , i ] = 0
+# }
+# 
+# # sum up the alternating columns to get per-individual counts
+# mat.calls.sum = mat.calls.bin[ , rep( c(T,F) , nrow(fam)) , drop=F ]
+# mat.calls.sum = mat.calls.sum + mat.calls.bin[ , rep( c(F,T) , nrow(fam)) , drop=F ]
+# 
+# # keep unique samples and link with case/control status
+# uni = read.table("~/Desktop/LungData/Notebooks/YLvsTOPMED_metrics_PCs_SNV_SV_withEUR_PC_ASHK_ancestry_label_EURONLY_carcinoids_excluded_45under_cases.tsv",head=T,as.is=T)
+# m = match(fam[,2],uni$sample_ID)
+# uni = uni[m,]
+# 
+# keep = !is.na( m )
+# fam = fam[keep,]
+# mat.calls.sum = mat.calls.sum[,keep,drop=F]
+# uni = uni[keep,]
+# 
+# # count minor allele frequency and count
+# maf = 1 - apply(mat.calls.sum,1,mean,na.rm=T)/2
+# mac = apply( 2 - mat.calls.sum,1,sum,na.rm=T)
+# 
+# # count MAC <= 2 carriers
+# doubleton_carriers = apply( 2 - mat.calls.sum[ mac <= 2 , , drop=F ] , 2 , sum ,na.rm=T )
+# 
+# #if looking at counts only, remove !=0 and just use burden = doubleton_carriers; can also test singleton carriers
+# #for continuous burden use below
+# burden = doubleton_carriers
+# burden = doubleton_carriers !=0
+# y = uni$case_control == "case"
+# #since y (case/control status) is binary variable, use logistic regression (glm) regardless of what type of variable burden is
+# reg = summary( glm( y ~ burden + uni$sex + uni$PC1_EUR + uni$PC2_EUR + uni$PC3_EUR + uni$PC4_EUR + uni$PC5_EUR , family="binomial" ) )
+# 
+# result_pvalue = reg$coef[2,4]
+# result_beta = reg$coef[2,1]
+# result_OR = exp(result_beta)
+# 
+# writeLines(as.character(doubleton_carriers), "dbltest.tsv")
+```

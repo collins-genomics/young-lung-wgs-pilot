@@ -1,0 +1,473 @@
+---
+title: "Paper Heatmaps"
+output: html_document
+date: "2026-02-18"
+---
+
+```{r setup, include=FALSE}
+library(pheatmap)
+library(ComplexHeatmap)
+library(data.table)
+library(tidyr)
+library(purrr)
+library(circlize)
+library(matrixStats)
+library(stringr)
+library(UpSetR)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+
+source("../PilotData/Misc/yl_qc.custom_constants.R")
+source("../PilotData/Misc/yl_label_conversions.R")
+cancer.colors[["YL_NVS"]] <- case.color # extra definition to match category names
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r test}
+lgd = Legend(labels = c("p < 0.05", "FDR < 0.1", "FDR < 0.05"), title = "Significance", type = "points", 
+    pch = c("°", "*", "**"), background = "white", ncol = 3)
+draw(lgd)
+```
+
+```{r load_data, include=FALSE}
+type <- "Updated" # One of "", "Updated", only using updated results but keeping option to recreate past data for comparison
+all_data <- fread(paste0("../PilotData/HeatmapData/allRegResults", type, ".tsv"))
+all_data[, OR := exp(beta)]
+
+single_genes <- c("ALK", "ATM", "CFTR", "EGFR", "ERBB2", "MET", "ROS1", "YAP1") # leave tp53 
+all_data <- all_data[!geneset %in% single_genes]
+
+for (cat in unique(all_data$category)) {
+  all_data[category == cat, padj := p.adjust(pval, method = "fdr")]
+}
+
+all_data_uncap <- copy(all_data)
+all_data[, OR := ifelse(OR > 10, 10, OR)]
+setorder(all_data, category)
+
+# generate matrix with OR data
+or_mat <- as.data.table(pivot_wider(all_data[,c("geneset", "category", "OR")], 
+                                    names_from = category, 
+                                    values_from = OR,
+                                    values_fill = 1)) # fill NA OR values with 1
+
+categories <- unique(all_data$category)
+
+setSizes <- fread("../PilotData/Misc/setSizesUnique.txt")
+fixedNames <- fread("../PilotData/Misc/genesets_renamed.csv")[,1:2]
+nameMap <- fixedNames$V2
+names(nameMap) <- fixedNames$V1
+```
+
+```{r tp53_comparison}
+notp53 <- fread("../PilotData/Misc/allRegResultsWoTP53.tsv")
+notp53[, padj := p.adjust(pval), by = category]
+notp53[, OR := exp(beta)]
+
+fdrSigCV <- all_data_uncap[category == "YL_CV" & padj < 0.1]$geneset
+allSigCV <- all_data_uncap[category == "YL_CV" & pval < 0.05]$geneset
+
+fdrSigCV_HIGH <- all_data_uncap[category == "YL_CV_HIGH" & padj < 0.1]$geneset
+allSigCV_HIGH <- all_data_uncap[category == "YL_CV_HIGH" & pval < 0.05]$geneset
+```
+
+```{r tp53_ratios}
+print(paste0(nrow(notp53[geneset %in% fdrSigCV & pval < 0.05 & category == "YL_CV"]), " out of ", length(fdrSigCV), " FDR sig. sets in YL_CV"))
+print(paste0(nrow(notp53[geneset %in% allSigCV & pval < 0.05 & category == "YL_CV"]), " out of ", length(allSigCV), " nom. sig. sets in YL_CV"))
+print(paste0(nrow(notp53[geneset %in% fdrSigCV_HIGH & pval < 0.05 & category == "YL_CV_HIGH"]), " out of ", length(fdrSigCV_HIGH), " FDR sig. sets in YL_CV"))
+print(paste0(nrow(notp53[geneset %in% allSigCV_HIGH & pval < 0.05 & category == "YL_CV_HIGH"]), " out of ", length(allSigCV_HIGH), " nom. sig. sets in YL_CV"))
+```
+
+```{r tp53_OR_plot, fig.height=8, fig.width=12}
+merged <- all_data_uncap[notp53, on = c("geneset" = "geneset", "category" = "category")]
+pltData <- merged[category == "YL_CV" & padj < 0.1]
+# ggplot(data = pltData, aes(i.OR, OR, label = map_chr(geneset, make_readable), color = i.pval < 0.05)) + 
+#   geom_point() + 
+#   geom_text_repel(min.segment.length = 0) + 
+#   xlim(0, 10) + 
+#   ylim(0, 10) + 
+#   scale_color_manual(values = c("black", "red"), name = "p < 0.05 (no TP53)") +
+#   theme_minimal() + 
+#   geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dotted") + 
+#   xlab("OR (w/o TP53)") + ylab("OR") + 
+#   ggtitle("FDR Significant (q<0.1) Sets from Original Tests") + 
+#   theme(text = element_text(size = 20))
+```
+
+```{r plot_function, echo=FALSE}
+# helper function to get significance mark for a given geneset and category
+get_sig_mark <- function(gset, cat, refTable) {
+  # check for missing values, these come from NAs in pivoted matrix
+  if (!nrow(refTable[geneset == gset][category == cat])) {
+    return("")
+  }
+  pval <- refTable[geneset == gset][category == cat]$pval
+  padj <- refTable[geneset == gset][category == cat]$padj
+  if (pval >= 0.05) { 
+    "" # not significant
+  } else if (padj >= 0.1) {
+    "°" # nominally significant
+  } else if (padj >= 0.05) {
+    "*" # significant
+  } else {
+    "**" # "highly" significant
+  }
+}
+
+# sets color based on age-aware regression significance
+get_color <- function(gset, cat, refTable) {
+  if (!nrow(refTable[geneset == gset][category == cat])) {
+    return("black")
+  }
+  if (refTable[geneset == gset][category == cat]$i.pval < 0.05) {
+    "black"
+  } else {
+    "gray"
+  }
+}
+
+# convert underscored all-caps labels to human readable
+make_readable <- function(text, multiline = FALSE) {
+  # Fixed Names
+  if (text %in% names(nameMap)) {
+    return(nameMap[text])
+  }
+    
+  # Old Method
+  for (word in names(compound.conversions)) {
+    text <- str_replace_all(text, word, compound.conversions[word])
+  }
+  words <- str_split(text, "_| ")[[1]]
+  words <- ifelse(words %in% names(label.conversions), label.conversions[words], words)
+  words <- ifelse(words %in% keep.upper, words, str_to_title(words))
+  if (multiline) {
+    words[length(words)/2] <- paste0(words[length(words)/2], "\n")
+  }
+  paste(words, collapse = " ")
+}
+
+# custom plot function for figure heatmaps
+# data is formatted as a geneset-by-cohort matrix with geneset as the first column
+# cohort matches the cohort labels provided in the custom constants file
+figure_hmap <- function(data, cohort, refTable, ...) {
+  # define color map based on constants
+  colFun <- colorRamp2(c(0, 10), c("white", cancer.colors[[cohort]]))
+  Heatmap(data[,-1],
+          cluster_rows = FALSE,
+          cluster_columns = FALSE,
+          column_labels = map_chr(str_replace_all(colnames(data[,-1]), "YL_|NVS_", ""), make_readable),
+          column_names_gp = gpar(fontsize = 10),
+          column_names_rot = 45,
+          col = colFun,
+          height = nrow(data) * unit(5, "mm"),
+          width = (ncol(data) - 1) * unit(6, "mm"),
+          cell_fun = function(j, i, x, y, width, height, fill) {
+            grid.text(get_sig_mark(data$geneset[i], colnames(data)[j+1], refTable), 
+                      x, y, gp = gpar(fontsize = 10, 
+                                      # col = get_color(data$geneset[i], colnames(data)[j+1], refTable),
+                                      col = "black"))
+          },
+          rect_gp = gpar(col = "darkgray", lwd = 0.5),
+          row_labels = map_chr(data$geneset, make_readable),
+          row_names_gp = gpar(fontsize = 8),
+          row_names_side = "left",
+          heatmap_legend_param = list(legend_direction = "horizontal", legend_width = unit(3, "cm")),
+          ...)
+}
+
+
+# Both of the following use standard error as input (s1, s2)
+# get test statistic for welch's t test
+welch_stat <- function(m1, m2, s1, s2) {
+  (m1 - m2) / (sqrt(s1^2 + s2^2))
+}
+
+# get degrees of freedom for welch's t test
+welch_df <- function(s1, s2, n1, n2) {
+  (s1^2 + s2^2)^2 / (s1^4 / (n1 - 1) + s2^4 / (n2 - 1))
+}
+```
+
+```{r plot_data, include=FALSE}
+hmapGroups <- c("YL", "YL_NVS", "NVS")
+
+sigSets <- unique(all_data[pval < 0.05][padj < 0.1]$geneset)
+sigSets <- sigSets[!sigSets %in% c("NEV_SMOK_JCO_WES_GERMLINE_NON_SMOK", "REACTOME_EGFR_DOWNREGULATION", "NEV_SMOK_WES_WGS_GERMLINE_COMBINED")]
+or_mat_sig <- or_mat[geneset %in% sigSets]
+
+# order by OR across all columns
+or_mat_sig[, let(colsums = rowSums(as.matrix(or_mat_sig[, -1])),
+                 colmaxs = rowMaxs(as.matrix(or_mat_sig[, -1])))]
+setorderv(or_mat_sig, cols = c("colmaxs", "colsums"), order = -1) # TODO check different options here
+
+# order by OR sum across only YL columns
+or_mat_sig[, let(colsums = rowSums(as.matrix(or_mat_sig[, 6:9])),
+                 colmaxs = rowMaxs(as.matrix(or_mat_sig[, 6:9])))]
+setorderv(or_mat_sig, cols = c("colmaxs", "colsums"), order = -1)
+
+# add age data to all_data
+ageData <- fread("../PilotData/HeatmapData/allRegResultsAge.tsv")
+all_data <- all_data[ageData, on = c("geneset", "category")]
+for (cat in unique(all_data$category)) {
+  all_data[category == cat, i.padj := p.adjust(i.pval, method = "fdr")]
+}
+
+sigSetSizes <- setSizes[match(or_mat_sig$geneset, setSizes$V1)]$V2
+sigSetSizes <- log10(sigSetSizes)
+
+# or_mat_sig <- head(or_mat_sig, 7)
+# sigSetSizes <- head(sigSetSizes, 7)
+
+hmaps <- lapply(hmapGroups, function(group) {
+  if (group != "NVS") {
+    figure_hmap(or_mat_sig[, .SD, .SDcols = patterns(paste0("geneset|^", group, "_(C|H)"))],
+                group,
+                all_data,
+                name = make_readable(paste0("OR ", group)),
+                column_title = make_readable(group))    
+  } else {
+    figure_hmap(or_mat_sig[, .SD, .SDcols = patterns(paste0("geneset|^", group, "_(C|H)"))],
+                group,
+                all_data,
+                name = make_readable(paste0("OR ", group)),
+                column_title = make_readable(group),
+                right_annotation = rowAnnotation(geneset_size = anno_barplot(sigSetSizes,
+                                                                             axis = TRUE,
+                                                                             border = FALSE,
+                                                                             axis_param = list(at = c(1,2,3), 
+                                                                                               labels = c("10", "100", "1000"))),
+                                                 annotation_name_rot = 45,
+                                                 annotation_label = "geneset\nsize"))    
+  }
+})
+            
+pdf(paste0("../Plots/CombinedHeatmap", type, ".pdf"), width = 16, height = 12)
+draw(Reduce("+", hmaps), heatmap_legend_side = "top")
+dev.off()
+```
+
+```{r get_comb, echo=FALSE}
+padj_cut <- 0.1
+groupLevels <- c("CV", "CV_HIGH", "CV_HIGH_REVEL05", "HIGH_MOD")
+
+combSizes <- lapply(groupLevels, function(level) {
+  tempSets <- lapply(hmapGroups, function(cat) {
+    all_data[category == paste0(cat, "_", level)][padj < padj_cut]$geneset
+  })
+  names(tempSets) <- hmapGroups
+  comb_mat <- normalize_comb_mat(make_comb_mat(tempSets, mode = "intersect"), full_comb_sets = TRUE)
+  comb_size(comb_mat)
+})
+names(combSizes) <- groupLevels
+
+# using this to show "set size" in upset plot, unsure if better option available
+allSigComb <- lapply(hmapGroups, function(cat) {
+  all_data[category %like% paste0("^", cat, "_(C|H)")][padj < padj_cut]$geneset
+})
+names(allSigComb) <- hmapGroups
+allSigComb <- normalize_comb_mat(make_comb_mat(allSigComb), full_comb_sets = TRUE)
+```
+
+```{r upset_plot, echo=FALSE}
+upset_ann <- HeatmapAnnotation(
+  "CV" = anno_barplot(combSizes[["CV"]],
+                      gp = gpar(fill = "black"), height = unit(1.5, "cm"), ylim = c(0, 40)),
+  "CV High" = anno_barplot(combSizes[["CV_HIGH"]],
+                      gp = gpar(fill = "black"), height = unit(1.5, "cm"), ylim = c(0, 40)),
+  # "CV High REVEL 0.5" = anno_barplot(combSizes[["CV_HIGH_REVEL05"]],
+  #                     gp = gpar(fill = "black"), height = unit(1.5, "cm"), ylim = c(0, 40)),
+  # "High Moderate" = anno_barplot(combSizes[["HIGH_MOD"]],
+  #                     gp = gpar(fill = "black"), height = unit(1.5, "cm"), ylim = c(0, 40)),
+  gap = unit(2, "mm")
+)
+
+pdf(paste0("../Plots/geneset_upset", type, ".pdf"))
+UpSet(allSigComb, top_annotation = upset_ann,
+      row_labels = c("Never-smokers", "Young Lung", "YL+NVS"),
+      set_order = c("YL", "YL_NVS", "NVS"),
+      height = unit(1, "cm") * 3,
+      width = unit(6, "cm"),
+      right_annotation = upset_right_annotation(
+        allSigComb,
+        gp = gpar(fill = c(cancer.colors[["NVS"]], cancer.colors[["YL"]], cancer.colors[["YL_NVS"]]))
+      ))
+dev.off()
+```
+
+```{r or_plots, include=FALSE}
+pltData <- all_data_uncap[!(category %like% "YL_NVS")]
+pltData[, let(level = str_replace_all(category, "YL_|NVS_", ""),
+              category = str_extract(category, "YL|NVS"))]
+
+sigData <- as.data.table(pivot_wider(
+  pltData[, c("category", "geneset", "level", "padj")],
+  names_from = "category",
+  values_from = "padj",
+  values_fill = 1
+))
+sigData[, significance := ifelse(YL < 0.1,
+                                 ifelse(NVS < 0.1, "both", "YL"),
+                                 ifelse(NVS < 0.1, "NVS", "none"))]
+sigData[, highsig := YL < 0.05 | NVS < 0.05]
+
+pltData <- as.data.table(pivot_wider(
+  pltData[, c("category", "geneset", "level", "OR")],
+  names_from = "category",
+  values_from = "OR",
+  values_fill = 1
+))
+pltData <- pltData[sigData[,c("geneset", "level", "significance", "highsig")], on = c("geneset", "level")]
+
+pltData <- pltData[YL < 100 & NVS < 100]
+# pltData <- pltData[significance != "none"]
+
+lblSets <- c("TP53") # genesets to label
+
+orPlots <- lapply(groupLevels, function(lvl) {
+  pltMax <- max(c(pltData[level == lvl]$YL, pltData[level == lvl]$NVS, 20))
+  ggplot(pltData[level == lvl][order(-significance)], aes(log2(NVS), log2(YL),
+                                                          colour = significance,
+                                                          label = ifelse(highsig, map_chr(geneset, make_readable, multiline = TRUE), ""))) +
+    # ggplot(pltData[level == lvl][order(-significance)], aes(log2(NVS), log2(YL), 
+    #                                                       colour = significance)) +
+    geom_point(size = 4) +
+    geom_text_repel(show.legend = FALSE,
+                    size = 4,
+                    min.segment.length = 0,
+                    colour = "black",
+                    max.overlaps = 100,
+                    lineheight = 0.75,
+                    force_pull = 0.01,
+                    force = 200,
+                    segment.size = 0.1,
+                    label.padding = 4,
+                    arrow = arrow(length = unit(0.1, 'cm'), type = 'closed')) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    scale_y_continuous(limits = c(-1, 4)) +
+    scale_x_continuous(limits = c(-1, 4)) +
+    xlab("Never-smokers\nlog2(OR)") +
+    ylab("Young Lung\nlog2(OR)") +
+    theme_classic() +
+    theme(axis.title.x = element_text(size = 20), 
+          axis.title.y = element_text(size = 20),
+          plot.title = element_text(size = 24),
+          legend.text = element_text(size = 20),
+          legend.title = element_text(size = 24)) +
+    ggtitle(make_readable(lvl)) +
+    scale_color_manual(name = "Significance (padj < 0.1)",
+                       values = c("YL" = cancer.colors[["YL"]],
+                                  "NVS" = cancer.colors[["NVS"]],
+                                  "both" = "black",
+                                  "none" = "lightgrey"),
+                       labels = c("both", "none", "Never-smoker", "Young Lung"))
+})
+
+orPlots[c(1,3,4)] <- lapply(orPlots[c(1,3,4)], function(p) p + theme(legend.position = "none"))
+
+
+Reduce('+', orPlots)
+ggsave(paste0("../Plots/OR_Scatter_all", type, ".pdf"), height = 6, width = 9)
+
+orPlots[[2]] <- orPlots[[2]] + 
+  theme(legend.position = "bottom", axis.text = element_text(size = 20)) +
+  guides(color = guide_legend(nrow = 2)) + ggtitle("")
+orPlots[[2]]
+ggsave("../Plots/scatter_cv_high.png", height = 8, width = 8)
+
+orPlots[[1]] + 
+  theme(legend.position = "bottom") +
+  guides(color = guide_legend(nrow = 2))
+ggsave("../Plots/scatter_cv.png", height = 6, width = 8)
+
+orPlots[[1]] / orPlots[[2]]
+ggsave("../Plots/scatter_combined.png", height = 14, width = 8)
+```
+
+```{r compare_age, include = FALSE}
+noAge <- fread("../PilotData/HeatmapData/allRegResultsUpdated.tsv")
+wAge <- fread("../PilotData/HeatmapData/allRegResultsAge.tsv")
+ageComp <- noAge[wAge, on = c("geneset" = "geneset", "category" = "category")]
+ageComp[, let(OR = exp(beta), OR_w_age = exp(i.beta))]
+ageComp[, let(log2_OR = log2(OR), log2_OR_w_age = log2(OR_w_age))]
+ageComp[, log_OR_diff := abs(log2_OR - log2_OR_w_age)]
+
+for (cat in categories) {
+  ageComp[category == cat, let(padj = p.adjust(pval, method = "fdr"),
+                               padj_w_age = p.adjust(i.pval, method = "fdr"))]
+}
+
+ageComp[, significance := fifelse(padj < 0.1, "padj < 0.1", "n.s.")]
+setorder(ageComp, significance)
+```
+
+```{r age_plots, include = FALSE}
+agePlts <- lapply(categories, function(cat) {
+  pltMin <- min(c(ageComp[category == cat]$log2_OR, ageComp[category == cat]$log2_OR_w_age))
+  pltMax <- max(c(ageComp[category == cat]$log2_OR, ageComp[category == cat]$log2_OR_w_age))
+  ggplot(ageComp[category == cat], aes(log2_OR, log2_OR_w_age, color = significance)) +
+    geom_point() +
+    # scale_y_continuous(limits = c(pltMin - 5, pltMax + 5)) +
+    # scale_x_continuous(limits = c(pltMin - 5, pltMax + 5)) +
+    scale_y_continuous(limits = c(-5, 10)) +
+    scale_x_continuous(limits = c(-5, 10)) +
+    xlab("log2(OR)") +
+    ylab("log2(OR)\nwith age") +
+    theme_classic() +
+    ggtitle(make_readable(cat)) + 
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    scale_color_manual(name = "Significance",
+                       values = c("padj < 0.1" = "red",
+                                  "n.s." = "grey"),
+                       labels = c("n.s.",
+                                  "padj < 0.1\n(w/o age)"))
+})
+names(agePlts) <- categories
+agePlts[-8] <- lapply(agePlts[-8], function(p) p + theme(legend.position = "none"))
+
+Reduce('+', agePlts)
+ggsave("../Plots/age_OR_comparison.pdf", height = 10, width = 14)
+```
+
+```{r pval_plots, include = FALSE}
+ageComp[, let(log10padj = -log10(padj), log10padj_w_age = -log10(padj_w_age))]
+pvalPlts <- lapply(categories, function(cat) {
+  pltMin <- min(c(ageComp[category == cat]$log10adj, ageComp[category == cat]$log10padj_w_age))
+  pltMax <- max(c(ageComp[category == cat]$log10padj, ageComp[category == cat]$log10padj_w_age))
+  ggplot(ageComp[category == cat], aes(log10padj, log10padj_w_age, color = significance)) +
+    geom_point() +
+    scale_y_continuous(limits = c(pltMin - 1, pltMax + 1)) +
+    scale_x_continuous(limits = c(pltMin - 1, pltMax + 1)) +
+    xlab("-log10(padj)") +
+    ylab("-log10(padj)\nwith age") +
+    theme_classic() +
+    ggtitle(make_readable(cat)) + 
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    geom_hline(yintercept = 1, color = "red", linetype = "dashed") +
+    geom_vline(xintercept = 1, color = "red", linetype = "dashed") +
+    scale_color_manual(name = "Significance",
+                       values = c("padj < 0.1" = "red",
+                                  "n.s." = "grey"),
+                       labels = c("n.s.",
+                                  "padj < 0.1\n(w/o age)"))
+})
+names(pvalPlts) <- categories
+pvalPlts[-8] <- lapply(pvalPlts[-8], function(p) p + theme(legend.position = "none"))
+
+Reduce('+', pvalPlts)
+ggsave("../Plots/age_pval_comparison.pdf", height = 10, width = 14)
+```
+
+```{r genesets}
+sets <- list.files("~/Desktop/LungData/PilotData/Misc/gene_list_files", full.names=TRUE)
+setlists <- map_chr(sets, function(gset) {
+  setgenes <- readLines(gset)
+  setgenes <- setgenes[setgenes != ""]
+  setgenes <- unique(str_trim(setgenes))
+  
+  setName <- str_extract(gset, "(?<=files\\/).*?(?=.txt)")
+  paste(c(setName, setgenes), collapse = ',')
+})
+```
